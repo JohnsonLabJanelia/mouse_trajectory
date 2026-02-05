@@ -1,0 +1,4 @@
+# For analyze_logs.py
+matplotlib>=3.5
+numpy>=1.20
+scipy>=1.7
