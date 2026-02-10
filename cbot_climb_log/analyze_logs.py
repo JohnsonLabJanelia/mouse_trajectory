@@ -457,7 +457,7 @@ def _plot_first_100_training_metric(
 
 
 def plot_learning_curves_first_100_training_combined(animal_data: dict, out_path: Path | None = None):
-    """Single figure: 3 panels stacked (duration, time to target, time to reward), shared x-axis."""
+    """Single figure: 3 panels stacked (duration, time to target, time to reward), shared x-axis. Saves EPS (primary) and high-res PNG."""
     max_trials = 100
     fig, axes = plt.subplots(3, 1, figsize=(10, 11), sharex=True)
     _plot_first_100_training_metric(
@@ -487,11 +487,32 @@ def plot_learning_curves_first_100_training_combined(animal_data: dict, out_path
         show_xlabel=True,
         max_trials=max_trials,
     )
-    plt.suptitle(f"Learning curves (first {max_trials} training trials)", y=1.02)
+    # Larger fonts for axis labels, titles, ticks, and legend
+    label_fontsize = 16
+    tick_fontsize = 14
+    legend_fontsize = 14
+    for ax in axes:
+        ax.set_xlabel(ax.get_xlabel(), fontsize=label_fontsize)
+        ax.set_ylabel(ax.get_ylabel(), fontsize=label_fontsize)
+        ax.set_title(ax.get_title(), fontsize=label_fontsize)
+        ax.tick_params(axis="both", labelsize=tick_fontsize)
+        leg = ax.get_legend()
+        if leg is not None:
+            for t in leg.get_texts():
+                t.set_fontsize(legend_fontsize)
+    plt.suptitle(f"Learning curves (first {max_trials} training trials)", y=1.02, fontsize=18)
     plt.tight_layout()
     if out_path:
-        plt.savefig(out_path, dpi=150)
-        print(f"Saved {out_path}")
+        out_path = Path(out_path)
+        base = out_path.parent / out_path.stem
+        # Primary: EPS (vector, high resolution)
+        eps_path = base.with_suffix(".eps")
+        plt.savefig(eps_path, format="eps", bbox_inches="tight")
+        print(f"Saved {eps_path}")
+        # Also save high-res PNG
+        png_path = base.with_suffix(".png")
+        plt.savefig(png_path, dpi=300, bbox_inches="tight")
+        print(f"Saved {png_path}")
     else:
         plt.show()
 
@@ -1262,7 +1283,7 @@ def main():
     )
     plot_learning_curves_first_100_training_combined(
         animal_data,
-        out_path=out_dir / "plots_learning_curves_first100_training_combined.png",
+        out_path=out_dir / "plots_learning_curves_first100_training_combined.eps",
     )
     plot_time_to_reward(
         animal_data,

@@ -2,15 +2,20 @@
 """
 Overlay 2D snout trajectory on a video frame image.
 
-Design:
-  1. Load 3D points (x, y, z, confidence) from data3D.csv for Snout.
-  2. Use camera calibration to project 3D → 2D for this camera (JARVIS formula).
-  3. Filter points by confidence (default 0.15 for plotting; arena/regions use 0.3 elsewhere).
-  4. Plot the filtered 2D trajectory on the frame image and save.
+Pipeline (order matters):
+  1. Load 3D Snout (x, y, z, confidence) from trial_dir/data3D.csv.
+  2. Build actual frame numbers: frame_start + row index (from trial folder name ..._start-end).
+  3. Project all 3D → 2D (JARVIS calibration) for the given camera.
+  4. Start/end trim (if arena_start_end.npz): drop points before first in start circle,
+     then drop points after last in end circle.
+  5. Confidence filter: keep points with confidence >= min_confidence (default 0.15).
+  6. Arena mask filter: keep only points inside predictions3D/arena_mask.npz (optional).
+  7. Jump filter: split at consecutive steps > jump_threshold px; drop segments with
+     fewer than min_segment_points (default 50).
+  8. Segment filter: keep only segments that have at least one point in start or end region.
+  9. Plot trajectory on frame (matplotlib), colored by actual frame number; save PNG.
 
-Arena mask and start/end regions are built separately (using confidence 0.3); this script
-only plots the trajectory with confidence 0.15. Further filtering (arena, start/end) can
-be added later.
+See docs/TRAJECTORY_VISUALIZATION.md for full documentation.
 """
 
 from pathlib import Path
@@ -27,6 +32,39 @@ from PIL import Image
 _script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_script_dir / "predictions3D"))
 from plot_trajectory_xy import parse_data3d_csv
+
+
+def _save_trajectory_csv(
+    path: Path,
+    *,
+    frame_number: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    segment_id: np.ndarray,
+    verbose: bool = True,
+) -> None:
+    """Write filtered trajectory to CSV for analysis: frame_number, x, y, z, u, v, segment_id."""
+    import csv
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["frame_number", "x", "y", "z", "u", "v", "segment_id"])
+        for i in range(len(frame_number)):
+            w.writerow([
+                int(frame_number[i]),
+                float(x[i]),
+                float(y[i]),
+                float(z[i]),
+                float(u[i]),
+                float(v[i]),
+                int(segment_id[i]),
+            ])
+    if verbose:
+        print(f"Saved trajectory CSV: {path} ({len(frame_number)} points)")
 
 
 def get_trial_frame_and_recording(trial_dir: Path) -> tuple[int, Path | None]:
@@ -72,23 +110,33 @@ def get_continuous_segments(
     v: np.ndarray,
     frame_indices: np.ndarray,
     jump_threshold_px: float,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    xyz: np.ndarray | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Split trajectory at large frame-to-frame steps (jumps).
-    Returns list of (u_seg, v_seg, frame_indices_seg), each segment has no internal jump.
+    Returns list of (u_seg, v_seg, frame_indices_seg) or (..., xyz_seg) if xyz is provided.
     """
     if len(u) < 2:
-        return [(u, v, frame_indices)] if len(u) > 0 else []
+        if len(u) > 0:
+            if xyz is not None:
+                return [(u, v, frame_indices, xyz)]
+            return [(u, v, frame_indices)]
+        return []
     dist = np.sqrt(np.diff(u.astype(float)) ** 2 + np.diff(v.astype(float)) ** 2)
     is_jump = dist > jump_threshold_px
     segments = []
     start = 0
     for i in range(len(is_jump)):
         if is_jump[i]:
-            # segment from start to i+1 (inclusive of point i, exclusive of i+1)
-            segments.append((u[start : i + 1], v[start : i + 1], frame_indices[start : i + 1]))
+            if xyz is not None:
+                segments.append((u[start : i + 1], v[start : i + 1], frame_indices[start : i + 1], xyz[start : i + 1]))
+            else:
+                segments.append((u[start : i + 1], v[start : i + 1], frame_indices[start : i + 1]))
             start = i + 1
-    segments.append((u[start:], v[start:], frame_indices[start:]))
+    if xyz is not None:
+        segments.append((u[start:], v[start:], frame_indices[start:], xyz[start:]))
+    else:
+        segments.append((u[start:], v[start:], frame_indices[start:]))
     return segments
 
 
@@ -204,6 +252,7 @@ def run(
     *,
     arena_mask: np.ndarray | None = None,
     start_end: dict | None = None,
+    output_trajectory_csv: Path | None = None,
     jump_threshold_px: float = 100.0,
     min_segment_points: int = 50,
     min_confidence: float = 0.15,
@@ -237,6 +286,13 @@ def run(
         Image.fromarray(frame).save(out_path)
         return
 
+    # Actual frame number for each row (trial folder name has frame range, e.g. ..._28678-31180)
+    try:
+        frame_start, _ = get_trial_frame_and_recording(csv_path.parent)
+        frame_numbers = frame_start + np.arange(n_orig, dtype=np.int64)
+    except (ValueError, OSError):
+        frame_numbers = np.arange(n_orig, dtype=np.int64)
+
     # Project all 3D → 2D first (needed for start-region trim)
     points_2d = project_3d_to_2d(points_3d, calib)
     u = points_2d[:, 0]
@@ -256,6 +312,7 @@ def run(
         conf = conf[first_idx:]
         u = u[first_idx:]
         v = v[first_idx:]
+        frame_numbers = frame_numbers[first_idx:]
         if verbose:
             print(f"Start trim: dropped first {first_idx} points (not in start area), kept {len(points_3d)}")
 
@@ -269,6 +326,7 @@ def run(
             conf = conf[: last_idx + 1]
             u = u[: last_idx + 1]
             v = v[: last_idx + 1]
+            frame_numbers = frame_numbers[: last_idx + 1]
             if verbose:
                 print(f"End trim: dropped {n_before - (last_idx + 1)} points after last in end region, kept {len(points_3d)}")
 
@@ -277,7 +335,7 @@ def run(
     points_3d = points_3d[keep]
     u = u[keep]
     v = v[keep]
-    conf = conf[keep]
+    frame_numbers = frame_numbers[keep]
     if verbose:
         n_drop = (~keep).sum()
         print(f"Confidence >= {min_confidence}: kept {len(points_3d)} points, dropped {n_drop}")
@@ -288,9 +346,25 @@ def run(
         Image.fromarray(frame).save(out_path)
         return
 
-    frame_indices = np.arange(len(points_3d))
+    # Drop points with negative elevation (z < 0 not physically possible)
+    keep_z = points_3d[:, 2] >= 0
+    n_neg = (~keep_z).sum()
+    if n_neg > 0:
+        points_3d = points_3d[keep_z]
+        u = u[keep_z]
+        v = v[keep_z]
+        frame_numbers = frame_numbers[keep_z]
+        if verbose:
+            print(f"Elevation filter: dropped {n_neg} points with z < 0, kept {len(points_3d)}")
+    if len(points_3d) == 0:
+        if verbose:
+            print("No points after elevation filter; saving frame only.")
+        Image.fromarray(frame).save(out_path)
+        return
 
-    # Filter by arena mask: keep only points inside image and inside mask
+    frame_indices = frame_numbers
+
+    # Filter by arena mask: keep only points inside image and inside mask (carry points_3d for export)
     if arena_mask is not None:
         in_bounds = (
             (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
@@ -303,6 +377,7 @@ def run(
         u = u[in_mask]
         v = v[in_mask]
         frame_indices = frame_indices[in_mask]
+        points_3d = points_3d[in_mask]
         if verbose:
             n_removed = np.sum(~in_mask)
             print(f"Arena mask: kept {len(u)} points, removed {n_removed}")
@@ -312,8 +387,8 @@ def run(
             Image.fromarray(frame).save(out_path)
             return
 
-    # Split at jumps and keep only long enough segments (no jump artifacts)
-    segments = get_continuous_segments(u, v, frame_indices, jump_threshold_px)
+    # Split at jumps and keep only long enough segments (no jump artifacts); carry xyz for export
+    segments = get_continuous_segments(u, v, frame_indices, jump_threshold_px, xyz=points_3d)
     kept = [s for s in segments if len(s[0]) >= min_segment_points]
     if not kept:
         if verbose:
@@ -339,10 +414,26 @@ def run(
     u = np.concatenate([s[0] for s in kept])
     v = np.concatenate([s[1] for s in kept])
     frame_indices = np.concatenate([s[2] for s in kept])
+    xyz = np.concatenate([s[3] for s in kept])  # (N, 3) for export
+    segment_id = np.concatenate([np.full(len(s[0]), i, dtype=np.int32) for i, s in enumerate(kept)])
     if verbose:
         n_dropped = sum(len(s[0]) for s in segments) - len(u)
         print(
             f"Jump filter: kept {len(u)} points in {len(kept)} segment(s), dropped {n_dropped} (segments with <{min_segment_points} pts or jumps >{jump_threshold_px}px)"
+        )
+
+    # Save filtered trajectory for analysis (optional)
+    if output_trajectory_csv is not None:
+        _save_trajectory_csv(
+            output_trajectory_csv,
+            frame_number=frame_indices,
+            x=xyz[:, 0],
+            y=xyz[:, 1],
+            z=xyz[:, 2],
+            u=u,
+            v=v,
+            segment_id=segment_id,
+            verbose=verbose,
         )
 
     # Matplotlib: image in pixel coords, trajectory overlaid (original style)
@@ -353,9 +444,9 @@ def run(
     ax.set_aspect("equal")
     ax.axis("off")
     scatter = ax.scatter(u, v, c=frame_indices, cmap="viridis", s=2, alpha=0.7)
-    for u_seg, v_seg, _ in kept:
-        ax.plot(u_seg, v_seg, color="yellow", alpha=0.25, linewidth=0.5)
-    plt.colorbar(scatter, ax=ax, label="Frame index")
+    for s in kept:
+        ax.plot(s[0], s[1], color="yellow", alpha=0.25, linewidth=0.5)
+    plt.colorbar(scatter, ax=ax, label="Frame number")
     ax.set_title("Snout trajectory (confidence >= " + str(min_confidence) + ")")
     plt.tight_layout()
     fig.savefig(out_path, dpi=100, bbox_inches="tight", pad_inches=0.1)
@@ -374,6 +465,7 @@ def main():
     parser.add_argument("--calib-path", type=Path, default=None, help="Calibration YAML; default from trial info.yaml")
     parser.add_argument("--frame-path", type=Path, default=None, help="Frame image; default trial_dir/frame.png")
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output image; default trial_dir/trajectory_on_frame.png")
+    parser.add_argument("--output-trajectory", type=Path, default=None, help="Save filtered trajectory to CSV (frame_number, x, y, z, u, v, segment_id) for analysis")
     parser.add_argument("--arena-mask", type=Path, default=None, help="Arena mask .npz; default predictions3D/arena_mask.npz")
     parser.add_argument("--no-arena-mask", action="store_true", help="Do not filter by arena mask")
     parser.add_argument("--arena-start-end", type=Path, default=None, help="Start/end regions .npz; default predictions3D/arena_start_end.npz")
@@ -445,6 +537,7 @@ def main():
         calib_path=calib_path,
         arena_mask=arena_mask,
         start_end=start_end,
+        output_trajectory_csv=args.output_trajectory,
         jump_threshold_px=args.jump_threshold,
         min_segment_points=args.min_segment_points,
         min_confidence=args.min_confidence,

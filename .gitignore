@@ -20,7 +20,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# Optional: uncomment to avoid committing large generated outputs
-# predictions3D/
-# pipeline_output/
-# cbot_climb_log/
+# Project-specific generated data / outputs (large, regenerable)
+# Keep analysis scripts in predictions3D/, but ignore per-trial folders
+predictions3D/Predictions_3D_trial_*/
+pipeline_output/
+trajectory_analysis/
+calib_params/
+
+# Logs and analysis plots from cbot_climb_log
+cbot_climb_log/logs/
+cbot_climb_log/plots_*.png

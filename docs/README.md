@@ -6,6 +6,8 @@ This directory contains documentation for the mouse trajectory analysis pipeline
 
 - **[PIPELINE.md](PIPELINE.md)**: Complete guide to the full pipeline (extraction → JARVIS prediction)
 - **[TRAJECTORY_VISUALIZATION.md](TRAJECTORY_VISUALIZATION.md)**: Documentation for trajectory visualization scripts (`plot_trajectory_xy.py`, `plot_trajectory_on_frame.py`, `extract_first_frame.py`)
+- **[FLOW_FIELD_PLOTS.md](FLOW_FIELD_PLOTS.md)**: How the two flow-field panels (elevation + flow direction, flow speed + flow direction) are computed and what they show
+- **[ANALYSIS_SUMMARY.md](ANALYSIS_SUMMARY.md)**: Summary of trajectory analysis: mouse choice (side pick at peak z), side-pick heatmap, vertical-on-left/right trajectory and flow-field plots, and trial-type filtering
 - **[../ISSUE_LOG.md](../ISSUE_LOG.md)**: Known issues and troubleshooting
 
 ## Quick Start

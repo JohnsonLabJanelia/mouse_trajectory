@@ -133,6 +133,22 @@ def session_csv_has_valid_trials(trials_csv: Path) -> bool:
     return False
 
 
+def count_valid_trials(trials_csv: Path) -> int:
+    """Count trials in a session CSV that have a valid frame range (frame_count > 0 or frame_id_start set)."""
+    n = 0
+    with open(trials_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                frame_count = int(row.get("frame_count", 0) or 0)
+            except (ValueError, TypeError):
+                frame_count = 0
+            has_start = bool((row.get("frame_id_start") or "").strip())
+            if frame_count > 0 or has_start:
+                n += 1
+    return n
+
+
 def run_predict_trials(
     recording_path: Path,
     trials_csv: Path,
@@ -462,6 +478,15 @@ def main():
 
     # --- Step 2: JARVIS predict_trials per session ---
     if run_jarvis:
+        # Base directory where JARVIS saves predictions for this project.
+        predictions_base = jarvis_hybridnet_dir / "projects" / args.project / "predictions" / "predictions3D"
+
+        # Track per-animal session counts so progress is clearer than a single global index.
+        from collections import Counter
+
+        total_sessions_by_animal: Counter[str] = Counter(a for a, _, _ in sessions_to_run)
+        seen_sessions_by_animal: Counter[str] = Counter()
+
         for i, (animal, video_folder, session_csv) in enumerate(sessions_to_run):
             recording_path = video_root / animal / video_folder
             if not recording_path.is_dir():
@@ -503,9 +528,29 @@ def main():
                 session_dataset = jarvis_calib
 
             output_subdir = f"{animal}_{video_folder}"
+
+            # If this session already has predictions for all valid trials, skip re-running JARVIS.
+            session_output_dir = predictions_base / output_subdir
+            if session_output_dir.is_dir():
+                existing_trials = len(list(session_output_dir.glob("Predictions_3D_trial_*")))
+                total_trials = count_valid_trials(session_csv)
+                if total_trials > 0 and existing_trials >= total_trials:
+                    seen_sessions_by_animal[animal] += 1
+                    animal_idx = seen_sessions_by_animal[animal]
+                    animal_total = total_sessions_by_animal[animal]
+                    if verbose:
+                        print(
+                            f"[JARVIS] [{animal} {animal_idx}/{animal_total}] {output_subdir} "
+                            f"(calib={session_dataset}) — already has {existing_trials}/{total_trials} trials, skipping"
+                        )
+                    continue
+
             if verbose:
+                seen_sessions_by_animal[animal] += 1
+                animal_idx = seen_sessions_by_animal[animal]
+                animal_total = total_sessions_by_animal[animal]
                 print(
-                    f"[JARVIS] [{i+1}/{len(sessions_to_run)}] {output_subdir} "
+                    f"[JARVIS] [{animal} {animal_idx}/{animal_total}] {output_subdir} "
                     f"(calib={session_dataset})"
                 )
             run_predict_trials(
