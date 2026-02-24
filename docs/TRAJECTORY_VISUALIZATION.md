@@ -203,22 +203,47 @@ python extract_first_frame.py Predictions_3D_trial_0000_11572-20491/ --camera Ca
 
 ---
 
-### 5. `batch_trajectory_on_frame.py` ⚠️ **Missing source file**
+### 5. `batch_trajectory_on_frame.py` ✅ **Batch extract frame + plot trajectory**
 
-**Location**: Should be at `/home/user/src/analyzeMiceTrajectory/batch_trajectory_on_frame.py` (currently only `.pyc` bytecode exists)
+**Location**: `batch_trajectory_on_frame.py` (project root)
 
-**Purpose**: Batch processes multiple trials, running `plot_trajectory_on_frame.py` for each trial folder.
+**Purpose**: For all JARVIS 3D predictions (rory and wilfred by default) under a predictions root: (1) extract the trial start frame from video into each trial folder as `frame.png`, (2) run `plot_trajectory_on_frame.py` to produce `trajectory_on_frame.png` and `trajectory_filtered.csv`. Used when predictions live under JARVIS-HybridNet (e.g. `predictions3D/{animal}_{video_folder}/Predictions_3D_trial_*/`) and videos are at a separate path (e.g. `/mnt/mouse2`).
 
-**Expected usage**:
+**What it does**:
+- Scans `--predictions-root` for session folders matching `{animal}_{video_folder}` (e.g. `rory_2025_12_23_16_57_09`).
+- For each trial folder `Predictions_3D_trial_XXXX_frameStart-frameEnd`: uses **frameStart** from the folder name as the frame index.
+- Video path: `{video_root}/{animal}/{video_folder}/{camera}.mp4`.
+- If `frame.png` is missing in the trial folder, runs `extract_first_frame.py` with `--recording-path` (so videos need not match `info.yaml`).
+- Then runs `plot_trajectory_on_frame.py` with `--output-trajectory trajectory_filtered.csv`.
+
+**Outputs per trial** (all inside the trial folder):
+
+| File | Description |
+|------|-------------|
+| `frame.png` | Extracted video frame (trial start frame). |
+| `trajectory_on_frame.png` | Frame with Snout trajectory overlaid. |
+| `trajectory_filtered.csv` | Filtered trajectory CSV for `analyze_trajectories.py`. |
+
+**Usage**:
 ```bash
-# Process all trials in a predictions3D directory
-python batch_trajectory_on_frame.py predictions3D/
+# Process all trials (rory and wilfred). Default paths point to JARVIS predictions and /mnt/mouse2.
+python batch_trajectory_on_frame.py
 
-# Process trials for a specific animal/session
-python batch_trajectory_on_frame.py --animal mickey --session 2026_01_01_15_18_31
+# Explicit paths
+python batch_trajectory_on_frame.py \
+  --predictions-root /home/user/src/JARVIS-HybridNet/projects/mouseClimb4/predictions/predictions3D \
+  --video-root /mnt/mouse2 \
+  --animals rory wilfred \
+  --camera Cam2005325
+
+# Skip trials that already have trajectory_filtered.csv
+python batch_trajectory_on_frame.py --skip-existing
+
+# List trials only (no extraction or plotting)
+python batch_trajectory_on_frame.py --dry-run
 ```
 
-**Status**: ⚠️ **Source file missing** — only `.pyc` bytecode exists.
+**Status**: ✅ Implemented and tested; full run (400 trials for rory and wilfred) completes successfully. See **Running on existing JARVIS predictions** in `docs/PIPELINE.md` for the full workflow (batch → `analyze_trajectories.py`).
 
 ---
 
@@ -256,16 +281,4 @@ number_frames: 3360
 3. **Plot x-y trajectory**: Use `plot_trajectory_xy.py` for top-down 2D view
 4. **Overlay on video frame**: Use `plot_trajectory_on_frame.py` to see trajectory on actual camera view (requires calibration and frame image)
 
----
-
-## Missing Scripts
-
-✅ **Status**: `plot_trajectory_on_frame.py` and `extract_first_frame.py` have been **restored** by reconstructing them from bytecode analysis, function signatures, and extracted strings.
-
-⚠️ **Action needed**: `batch_trajectory_on_frame.py` is still missing. It likely batch processes multiple trials by calling `plot_trajectory_on_frame.py` for each trial folder. You can create it or use a simple shell loop:
-
-```bash
-for trial_dir in predictions3D/Predictions_3D_trial_*/; do
-    python plot_trajectory_on_frame.py "$trial_dir" --camera Cam2005325
-done
-```
+**Batch workflow** (when using JARVIS predictions under a separate predictions root and videos at e.g. `/mnt/mouse2`): Run `batch_trajectory_on_frame.py` once to extract frames and plot trajectories for all trials; then run `analyze_trajectories.py` on the same predictions root. Full details in `docs/PIPELINE.md` → **Running on existing JARVIS predictions (predictions3D)**.

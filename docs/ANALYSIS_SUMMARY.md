@@ -62,13 +62,40 @@ Logic: 40×40 spatial grid, dz-weighted flow and speed, turbo colormap, black ar
 
 ---
 
-## 6. Other outputs (unchanged by this summary)
+## 6. Multi-session and early / mid / late phase comparison
 
-- `trajectory_stats_summary.csv` — path length, duration, n_points, n_segments per trial.  
-- `peak_elevation_points.csv` — (x, y, z, frame) of peak z per trial.  
-- `path_to_peak_summary.csv` — frames/seconds/path length to peak per trial.  
+When the predictions root contains **session folders** (e.g. `rory_2025_12_23_16_57_09`, `wilfred_2026_01_08_16_05_24`), the script:
+
+- **Per-trial columns:** Each row in `trajectory_stats_summary.csv` (and peak/path-to-peak CSVs) includes `animal`, `session_folder`, `session_date`, `phase`, and `session_rank`.  
+  - **phase** is derived from session order: **early** (first third of sessions), **mid** (middle third), **late** (last third), or **single** when the animal has only one session.  
+  - **session_rank** is 1-based session index (1 = first session for that animal).
+
+- **Phase summary:** `trajectory_analysis/phase_summary.csv` — one row per (animal, phase) with `n_trials`, `mean_path_length_3d`, `std_path_length_3d`, `mean_duration_frames`, `mean_n_segments`, etc., so you can compare trajectory metrics **early vs mid vs late** sessions.
+
+- **Plots:**  
+  - `path_length_by_phase.png` — boxplot of path length by phase (early/mid/late) per animal.  
+  - `path_length_vs_session_rank.png` — path length vs session order (1, 2, 3, …) per animal with optional linear trend.  
+  - `trajectories_xy_by_animal_phase.png` — all trials, 2×3 grid (rory/wilfred × early/mid/late).  
+  - `trajectories_xy_vertical_on_left_by_animal_phase.png` — vertical-on-left trials only, same 2×3 grid.  
+  - `trajectories_xy_vertical_on_right_by_animal_phase.png` — vertical-on-right trials only, same 2×3 grid.
+
+**Filter by animal:** Use `--animal` to restrict analysis to one or more animals (e.g. all trials for one animal):
+
+```bash
+python analyze_trajectories.py /path/to/predictions3D -o trajectory_analysis --animal rory
+python analyze_trajectories.py /path/to/predictions3D -o trajectory_analysis --animal rory wilfred
+```
+
+---
+
+## 7. Other outputs
+
+- `trajectory_stats_summary.csv` — path length, duration, n_points, n_segments, animal, session_folder, phase, session_rank per trial.  
+- `phase_summary.csv` — early/mid/late summary per animal (when using nested session layout).  
+- `peak_elevation_points.csv` — (x, y, z, frame, animal, session_folder, phase) of peak z per trial.  
+- `path_to_peak_summary.csv` — frames/seconds/path length to peak per trial (with animal, phase).  
 - `trial_types.csv` — produced by `cbot_climb_log/export_trial_types_for_trajectories.py`; used for angles and trial-type subsets.  
-- Various other plots (example trajectories, elevation vs frame, boxplots, etc.).
+- Various other plots (example trajectories, elevation vs frame, boxplots, path length by phase, path length vs session rank, etc.).
 
 ---
 
@@ -77,6 +104,23 @@ Logic: 40×40 spatial grid, dz-weighted flow and speed, turbo colormap, black ar
 ```bash
 # From repo root; trial_types.csv should already exist in trajectory_analysis/
 python analyze_trajectories.py predictions3D -o trajectory_analysis
+
+# JARVIS predictions root (multiple sessions, rory and wilfred)
+python analyze_trajectories.py /home/user/src/JARVIS-HybridNet/projects/mouseClimb4/predictions/predictions3D -o trajectory_analysis
+
+# One animal only (all sessions and trials for that animal)
+python analyze_trajectories.py /path/to/predictions3D -o trajectory_analysis --animal rory
 ```
 
-For the trial-type–specific plots and flow fields, `trajectory_analysis/trial_types.csv` must exist (run `cbot_climb_log/export_trial_types_for_trajectories.py` as needed to generate it).
+For the trial-type–specific plots and flow fields (including vertical on left/right by animal × phase), `trajectory_analysis/trial_types.csv` must exist. **To build it from rory and wilfred logs:**
+
+```bash
+cd cbot_climb_log
+python export_trial_types_for_trajectories.py \
+  --predictions-dir /path/to/predictions3D \
+  --animals rory wilfred \
+  -o ../trajectory_analysis/trial_types.csv \
+  --logs-dir logs
+```
+
+The script matches each prediction session folder (e.g. `rory_2025_12_23_16_57_09`) to the closest same-day log session under `logs/rory/` and `logs/wilfred/`, and reads `left_angle_deg` / `right_angle_deg` from `robot_manager.log`. Optionally use `trial_frames.csv` (from `extract_trial_frames.py` for rory/wilfred) for exact frame-range matching.

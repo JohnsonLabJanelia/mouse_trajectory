@@ -33,6 +33,11 @@ _script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_script_dir / "predictions3D"))
 from plot_trajectory_xy import parse_data3d_csv
 
+# Trajectory filters (see docs/TRAJECTORY_FILTERS.md); applied when saving trajectory_filtered.csv
+MAX_Z = 150.0
+U_LOW_THRESHOLD = 1250.0  # px
+Z_CAP_WHEN_U_LOW = 50.0  # when u < U_LOW_THRESHOLD, drop points with z > this
+
 
 def _save_trajectory_csv(
     path: Path,
@@ -346,19 +351,37 @@ def run(
         Image.fromarray(frame).save(out_path)
         return
 
-    # Drop points with negative elevation (z < 0 not physically possible)
-    keep_z = points_3d[:, 2] >= 0
-    n_neg = (~keep_z).sum()
-    if n_neg > 0:
+    # Drop points with z < 0 or z > MAX_Z (outliers)
+    z_vals = points_3d[:, 2]
+    keep_z = (z_vals >= 0) & (z_vals <= MAX_Z)
+    n_drop_z = (~keep_z).sum()
+    if n_drop_z > 0:
         points_3d = points_3d[keep_z]
         u = u[keep_z]
         v = v[keep_z]
         frame_numbers = frame_numbers[keep_z]
+        z_vals = z_vals[keep_z]
         if verbose:
-            print(f"Elevation filter: dropped {n_neg} points with z < 0, kept {len(points_3d)}")
+            print(f"Elevation filter: dropped {n_drop_z} points (z < 0 or z > {MAX_Z}), kept {len(points_3d)}")
     if len(points_3d) == 0:
         if verbose:
             print("No points after elevation filter; saving frame only.")
+        Image.fromarray(frame).save(out_path)
+        return
+
+    # Drop points with u < U_LOW_THRESHOLD and z > Z_CAP_WHEN_U_LOW (region-specific outlier)
+    keep_region = (u >= U_LOW_THRESHOLD) | (z_vals <= Z_CAP_WHEN_U_LOW)
+    n_drop_region = (~keep_region).sum()
+    if n_drop_region > 0:
+        points_3d = points_3d[keep_region]
+        u = u[keep_region]
+        v = v[keep_region]
+        frame_numbers = frame_numbers[keep_region]
+        if verbose:
+            print(f"Region filter: dropped {n_drop_region} points (u < {U_LOW_THRESHOLD} and z > {Z_CAP_WHEN_U_LOW}), kept {len(points_3d)}")
+    if len(points_3d) == 0:
+        if verbose:
+            print("No points after region filter; saving frame only.")
         Image.fromarray(frame).save(out_path)
         return
 

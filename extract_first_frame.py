@@ -87,6 +87,12 @@ def main():
         default=0,
         help="Frame index to extract (default: 0, or frame_start from folder name)",
     )
+    parser.add_argument(
+        "--recording-path",
+        type=Path,
+        default=None,
+        help="Override recording path (e.g. /mnt/mouse2/animal/YYYY_MM_DD_HH_MM_SS) when info.yaml is missing or wrong",
+    )
     args = parser.parse_args()
     
     input_path = args.input.resolve()
@@ -98,10 +104,12 @@ def main():
             raise ValueError("--camera required when input is a prediction folder")
         
         frame_start, recording_path = parse_trial_frame_and_recording(input_path)
+        if args.recording_path is not None:
+            recording_path = Path(args.recording_path).resolve()
         frame_index = frame_start if args.frame_index == 0 else args.frame_index
         
         if not recording_path:
-            raise ValueError(f"Could not find recording_path in {input_path / 'info.yaml'}")
+            raise ValueError(f"Could not find recording_path in {input_path / 'info.yaml'}; use --recording-path")
         
         # Find video file for this camera
         video_path = recording_path / f"{args.camera}.mp4"
