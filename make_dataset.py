@@ -168,9 +168,15 @@ def _iter_frames_decord(video_paths, frame_start, frame_end, stride,
     Uses NVDEC if a CUDA context is available, otherwise multi-threaded CPU
     decode.  A background thread prefetches the next chunk so GPU never waits.
     """
-    ctx = _decord.gpu(0) if torch.cuda.is_available() else _decord.cpu(0)
-    readers = [_decord.VideoReader(p, ctx=ctx, num_threads=4)
-               for p in video_paths]
+    # Try NVDEC (GPU) first; PyPI wheel usually lacks CUDA so fall back to CPU.
+    try:
+        ctx = _decord.gpu(0)
+        readers = [_decord.VideoReader(p, ctx=ctx, num_threads=1)
+                   for p in video_paths]
+    except Exception:
+        ctx = _decord.cpu(0)
+        readers = [_decord.VideoReader(p, ctx=ctx, num_threads=4)
+                   for p in video_paths]
     frame_indices = list(range(frame_start, frame_end + 1, stride))
 
     pf_queue = queue.Queue(maxsize=2)   # prefetch at most 2 chunks ahead
@@ -301,10 +307,26 @@ def predict_trial(
     frames_written = 0
 
     if HAVE_DECORD:
-        # Fast path: decord with NVDEC + async prefetch
-        frame_iter = _iter_frames_decord(
-            video_paths, frame_start, frame_end, stride)
-        for ok, imgs_buf in frame_iter:
+        # Fast path: decord with NVDEC (if available) + async prefetch
+        try:
+            frame_iter = _iter_frames_decord(
+                video_paths, frame_start, frame_end, stride)
+            # Consume first item to verify readers opened successfully
+            # before truncating the output file
+            first = next(frame_iter, None)
+        except Exception as e:
+            log.warning(f'decord failed ({e}), falling back to cv2')
+            HAVE_DECORD_LOCAL = False
+        else:
+            HAVE_DECORD_LOCAL = True
+    else:
+        HAVE_DECORD_LOCAL = False
+
+    if HAVE_DECORD_LOCAL:
+        def _gen():
+            yield first
+            yield from frame_iter
+        for ok, imgs_buf in _gen():
             if not ok:
                 writer.writerow(['NaN'] * (num_joints * 4))
                 frames_written += 1
@@ -320,7 +342,7 @@ def predict_trial(
             writer.writerow(row)
             frames_written += 1
 
-    else:
+    if not HAVE_DECORD_LOCAL:
         # cv2 fallback: sequential read with thread-pool per-camera
         log.warning('decord not available — using cv2 (slower). '
                     'Install with: pip install decord')
