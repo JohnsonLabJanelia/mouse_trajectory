@@ -341,26 +341,37 @@ the `make_dataset.py` invocation.
 ## 9. One-time environment setup (already done for `doq`)
 
 The `jarvis_repro` conda environment originally shipped with PyTorch 1.10.1+cu113
-(2021). This version is too old for `torch_tensorrt` 2.x. The following upgrade
-was applied once on the login node:
+(2021). The following upgrade was applied once on the login node:
 
 ```bash
 # Upgrade PyTorch to 2.5.1 (matches local workstation)
 ~/miniconda3/envs/jarvis_repro/bin/pip install \
     torch==2.5.1 torchvision==0.20.1 \
     --index-url https://download.pytorch.org/whl/cu121
-
-# Install TensorRT
-~/miniconda3/envs/jarvis_repro/bin/pip install torch_tensorrt==2.5.0
 ```
 
-If you are setting up a **new cluster account**, run these commands once on the
-login node before submitting any jobs. JARVIS itself (`jarvis-mocap 0.1.1`) is
-compatible with PyTorch 2.5.1 — no other changes needed.
+If you are setting up a **new cluster account**, run this once on the login node
+before submitting any jobs.
 
-> Note: `import torch_tensorrt` will print a warning on the login node
-> ("Unable to read CUDA capable devices") because the login node has no GPU.
-> This is harmless — it works correctly on GPU compute nodes.
+### TRT status on the cluster
+
+**TRT is disabled on the cluster** (`--no-trt` flag in `run_session.lsf`).
+
+The `torch_tensorrt` `ir='ts'` compilation mode (used by `compile_trt_hybrid24.py`)
+requires cuDNN 8. pip's `nvidia-cudnn-cu12` package installs cuDNN 9, which is
+incompatible. Additionally, the TorchScript TRT frontend is missing the
+`instance_norm` plugin needed by EfficientTrack's GroupNorm layers.
+
+TRT works on the **local workstation** because it uses system-installed TensorRT
+and cuDNN 8 libraries from the CUDA toolkit. Replicating this on the cluster
+would require a manual system TensorRT install — not worth it given the
+throughput is still acceptable without TRT:
+
+| Config | GPU | fps | 26-session wall time | cost |
+|---|---|---|---|---|
+| No TRT | A100 | ~9 fps | ~12 hrs | ~$31 |
+| No TRT | T4 | ~5 fps | ~22 hrs | ~$57 |
+| TRT (local only) | local | ~15 fps | — | — |
 
 ---
 

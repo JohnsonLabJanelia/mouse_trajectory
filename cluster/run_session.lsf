@@ -2,7 +2,7 @@
 #BSUB -W 12:00
 #BSUB -n 12
 #BSUB -gpu "num=1"
-#BSUB -q gpu_a100
+#BSUB -q gpu_t4
 #BSUB -P johnson
 #BSUB -J "dataset[1-26]"
 #BSUB -o /groups/johnson/home/doq/analyzeMiceTrajectory/cluster/logs/job_%J_%I.out
@@ -60,14 +60,9 @@ rsync -a \
 
 echo "Sync complete. Size: $(du -sh "$SCRATCH" | cut -f1)"
 
-# --- 2. Compile TRT if needed (once per GPU architecture) ---
-TRT_DIR="$HOME/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D"
-if [[ ! -f "$TRT_DIR/centerDetect.pt" ]]; then
-    echo "[2/4] Compiling TRT models for this GPU architecture ..."
-    python3 "$CODE_DIR/compile_trt_hybrid24.py" 2>&1
-else
-    echo "[2/4] TRT models already compiled, skipping."
-fi
+# --- 2. TRT skipped on cluster (ir='ts' mode requires cuDNN 8 + system TRT plugins;
+#        pip-installed torch_tensorrt 2.5.0 ships cuDNN 9 which is incompatible) ---
+echo "[2/4] Skipping TRT (not supported on cluster pip install — using PyTorch models)"
 
 # --- 3. Run predictions ---
 echo "[3/4] Running predictions for $SESSION ..."
@@ -77,6 +72,7 @@ python3 "$CODE_DIR/make_dataset.py" \
     --trials-dir "$OUTPUT_DIR" \
     --calib-root "$CODE_DIR/calib_params" \
     --output-dir "$OUTPUT_DIR" \
+    --no-trt \
     --skip-done \
     2>&1
 
