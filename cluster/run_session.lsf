@@ -60,9 +60,14 @@ rsync -a \
 
 echo "Sync complete. Size: $(du -sh "$SCRATCH" | cut -f1)"
 
-# --- 2. TRT (skipped — torch_tensorrt not in jarvis_repro env on cluster) ---
-# To enable TRT: pip install torch-tensorrt in jarvis_repro, then remove --no-trt below
-echo "[2/4] Skipping TRT compilation (using PyTorch models)"
+# --- 2. Compile TRT if needed (once per GPU architecture) ---
+TRT_DIR="$HOME/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D"
+if [[ ! -f "$TRT_DIR/centerDetect.pt" ]]; then
+    echo "[2/4] Compiling TRT models for this GPU architecture ..."
+    python3 "$CODE_DIR/compile_trt_hybrid24.py" 2>&1
+else
+    echo "[2/4] TRT models already compiled, skipping."
+fi
 
 # --- 3. Run predictions ---
 echo "[3/4] Running predictions for $SESSION ..."
@@ -72,7 +77,6 @@ python3 "$CODE_DIR/make_dataset.py" \
     --trials-dir "$OUTPUT_DIR" \
     --calib-root "$CODE_DIR/calib_params" \
     --output-dir "$OUTPUT_DIR" \
-    --no-trt \
     --skip-done \
     2>&1
 

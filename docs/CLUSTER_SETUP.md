@@ -338,34 +338,83 @@ the `make_dataset.py` invocation.
 
 ---
 
-## 9. Troubleshooting
+## 9. One-time environment setup (already done for `doq`)
+
+The `jarvis_repro` conda environment originally shipped with PyTorch 1.10.1+cu113
+(2021). This version is too old for `torch_tensorrt` 2.x. The following upgrade
+was applied once on the login node:
+
+```bash
+# Upgrade PyTorch to 2.5.1 (matches local workstation)
+~/miniconda3/envs/jarvis_repro/bin/pip install \
+    torch==2.5.1 torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install TensorRT
+~/miniconda3/envs/jarvis_repro/bin/pip install torch_tensorrt==2.5.0
+```
+
+If you are setting up a **new cluster account**, run these commands once on the
+login node before submitting any jobs. JARVIS itself (`jarvis-mocap 0.1.1`) is
+compatible with PyTorch 2.5.1 — no other changes needed.
+
+> Note: `import torch_tensorrt` will print a warning on the login node
+> ("Unable to read CUDA capable devices") because the login node has no GPU.
+> This is harmless — it works correctly on GPU compute nodes.
+
+---
+
+## 10. Troubleshooting
 
 **Job stays PEND for a long time**
-`gpu_a100` queue may be busy. Check with `bqueues`. You can try `gpu_gh200`
-(faster GPU, fewer slots) by editing `#BSUB -q gpu_a100` in `run_session.lsf`.
+`gpu_a100` is often busy (check with `bqueues`). Use `gpu_t4` for immediate
+slots (older GPU but x86_64 and always available):
+```bash
+bsub -J 'dataset[10]' -q gpu_t4 < ~/analyzeMiceTrajectory/cluster/run_session.lsf
+```
+**Do NOT use `gpu_gh200`** — GH200 is an ARM-based Grace Hopper node. The
+`jarvis_repro` conda env is compiled for x86_64 and will fail with
+`Exec format error` on ARM nodes.
 
 **rsync fails: Permission denied**
 The cluster's SSH key is not in the NAS `authorized_keys`. Re-do step 2c above.
 Test with: `ssh doq@login1 "ssh ratan@10.10.1.28 'echo ok'"`.
 
+**`/scratch` permission denied**
+`/scratch` has per-user subdirectories. If `/scratch/doq` doesn't exist,
+the job script will try to create it. If that fails, it falls back to `/tmp`
+(fine for sessions ≤700 GB, but slower). To pre-create it:
+```bash
+ssh doq@login1 "bsub -W 00:05 -n 1 -gpu 'num=1' -q gpu_t4 -P johnson -Is \
+    /bin/bash -c 'mkdir -p /scratch/doq && echo done'"
+```
+
 **JARVIS project not found**
-`make_dataset.py` looks for JARVIS in `~/JARVIS-HybridNet/`. Confirm:
+`make_dataset.py` auto-detects JARVIS at `~/JARVIS-HybridNet/`. Confirm:
 ```bash
 ssh doq@login1 "ls ~/JARVIS-HybridNet/projects/mouseHybrid24/config.yaml"
 ```
 
-**TRT compilation fails**
-Falls back to PyTorch automatically (slower, ~5 fps instead of ~15 fps).
-To recompile manually on a GPU node:
+**TRT compilation fails or is slow**
+TRT models are compiled fresh on first job per node (takes ~5–10 min).
+Compiled models are saved to `~/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D/`
+on the shared NFS home, so subsequent jobs on any node reuse them.
+To compile manually (e.g. to pre-warm before full array run):
 ```bash
-bsub -W 01:00 -n 4 -gpu "num=1" -q gpu_a100 -P johnson -Is /bin/bash
-~/miniconda3/bin/conda run -n jarvis_repro python3 \
-    ~/analyzeMiceTrajectory/compile_trt_hybrid24.py
+bsub -W 01:00 -n 4 -gpu "num=1" -q gpu_t4 -P johnson -Is /bin/bash
+# inside the job:
+export PATH="$HOME/miniconda3/envs/jarvis_repro/bin:$PATH"
+python3 ~/analyzeMiceTrajectory/compile_trt_hybrid24.py
 ```
+
+**`conda run` / `conda activate` fails in job**
+These do not work reliably in non-interactive LSF jobs. The job script
+activates the env by prepending its `bin/` to `PATH` directly — do not
+change this to `conda activate` or `conda run`.
 
 **Out of scratch space**
 `/scratch` is per-node local NVMe (~1.8 TB). A session is ~800 GB, so one job
-fits easily. If a previous crashed job left data behind: `rm -rf /scratch/doq_*`.
+fits. If a previous crashed job left data: `rm -rf /scratch/doq/job_*`.
 
 **Jobs wrote partial results then crashed**
 `--skip-done` checks for `data3D.csv` per trial. A partially-written CSV will
@@ -375,5 +424,11 @@ rm -rf ~/analyzeMiceTrajectory/dataset/predictions_raw/rory_SESSION/trial_XXXX_*
 ```
 Then resubmit just that session:
 ```bash
-bsub -J 'dataset[10]' < ~/analyzeMiceTrajectory/cluster/run_session.lsf
+bsub -J 'dataset[10]' -q gpu_t4 < ~/analyzeMiceTrajectory/cluster/run_session.lsf
 ```
+
+**Python type hint error: `unsupported operand type(s) for |`**
+Happens if the Python in your env is < 3.10. The codebase uses `X | None`
+return type hints which require Python 3.10+. These have been removed from
+`make_dataset.py` and `filter_dataset.py` for Python 3.9 compatibility.
+If you see this on a new script, remove the `-> Type | None` annotation.
