@@ -39,6 +39,7 @@ from datetime import datetime, date
 from pathlib import Path
 
 import queue
+import subprocess
 import threading
 
 import numpy as np
@@ -159,37 +160,66 @@ def _read_frame_parallel(caps, buf):
         return all(ex.map(_r, [(cap, i) for i, cap in enumerate(caps)]))
 
 
-def _iter_frames_prefetch(video_paths, img_h, img_w, frame_start, frame_end,
-                           stride, prefetch=4):
+def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
+                         stride, prefetch=8, use_hwaccel=True):
     """
-    Yield (ok, imgs_numpy) for each strided frame in [frame_start, frame_end].
-    imgs_numpy: (N_cams, H, W, 3) uint8 numpy array.
+    Decode video frames via ffmpeg subprocesses (one per camera) in a
+    background thread, yielding (ok, imgs_numpy) to the GPU inference loop.
 
-    A background thread reads ahead `prefetch` frames using a per-camera
-    ThreadPoolExecutor, so GPU inference and I/O run in parallel.
+    Uses NVDEC (h264_cuvid) when use_hwaccel=True and CUDA is available,
+    otherwise falls back to software decode.  16 ffmpeg processes run fully
+    in parallel, bypassing the Python GIL completely.
+
+    imgs_numpy: (N_cams, H, W, 3) uint8 BGR numpy array.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    num_cams = len(video_paths)
-    caps = [cv2.VideoCapture(p) for p in video_paths]
-    for cap in caps:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+    num_cams   = len(video_paths)
+    frame_size = img_h * img_w * 3          # bytes per BGR24 frame
+    n_frames   = frame_end - frame_start + 1
+    start_sec  = frame_start / fps
 
-    pf_queue = queue.Queue(maxsize=prefetch)
+    def _make_cmd(path):
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+        if use_hwaccel:
+            cmd += ['-hwaccel', 'cuda', '-c:v', 'h264_cuvid']
+        cmd += [
+            '-ss', f'{start_sec:.6f}',   # fast input-side seek
+            '-i', path,
+            '-frames:v', str(n_frames),  # limit output to trial length
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1',
+        ]
+        return cmd
+
+    # Start one ffmpeg process per camera
+    procs = [
+        subprocess.Popen(_make_cmd(p), stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL,
+                         bufsize=frame_size * 4)
+        for p in video_paths
+    ]
+
+    pf_queue  = queue.Queue(maxsize=prefetch)
+    n_to_read = (n_frames + stride - 1) // stride
 
     def _loader():
         with ThreadPoolExecutor(max_workers=num_cams) as ex:
-            for abs_frame in range(frame_start, frame_end + 1, stride):
-                buf = np.zeros((num_cams, img_h, img_w, 3), dtype=np.uint8)
+            for rel in range(n_frames):
+                on_stride = (rel % stride == 0)
+                buf = np.empty((num_cams, img_h, img_w, 3), dtype=np.uint8)
 
                 def read_one(i, _buf=buf):
-                    ret, img = caps[i].read()
-                    if ret and img is not None:
-                        _buf[i] = img
-                    return ret
+                    raw = procs[i].stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        return False
+                    _buf[i] = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        img_h, img_w, 3)
+                    return True
 
                 rets = list(ex.map(read_one, range(num_cams)))
-                pf_queue.put((all(rets), buf))
+                if on_stride:
+                    pf_queue.put((all(rets), buf))
+
         pf_queue.put(None)  # sentinel
 
     t = threading.Thread(target=_loader, daemon=True)
@@ -202,8 +232,12 @@ def _iter_frames_prefetch(video_paths, img_h, img_w, frame_start, frame_end,
         yield item
 
     t.join()
-    for cap in caps:
-        cap.release()
+    for proc in procs:
+        try:
+            proc.stdout.close()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 def _infer_one_frame(imgs_t, cd_model, kd_model, mean, std,
@@ -265,7 +299,7 @@ def predict_trial(
     cfg, cd_model, kd_model, mean, std,
     recording_path, calib_dir, camera_names,
     Ps_np, frame_start, frame_end, output_dir,
-    center_threshold=40.0, max_reproj_err=200.0, stride=1,
+    center_threshold=40.0, max_reproj_err=200.0, stride=1, fps=180.0,
 ):
     """Predict one trial and write data3D.csv to output_dir."""
     img_size_cd = cfg.CENTERDETECT.IMAGE_SIZE
@@ -301,8 +335,8 @@ def predict_trial(
 
     frames_written = 0
 
-    for ok, imgs_buf in _iter_frames_prefetch(
-            video_paths, img_h, img_w, frame_start, frame_end, stride):
+    for ok, imgs_buf in _iter_frames_ffmpeg(
+            video_paths, fps, img_h, img_w, frame_start, frame_end, stride):
         if not ok:
             writer.writerow(['NaN'] * (num_joints * 4))
             frames_written += 1
@@ -502,6 +536,7 @@ def main():
                     center_threshold=args.center_threshold,
                     max_reproj_err=args.max_reproj_err,
                     stride=args.stride,
+                    fps=fps,
                 )
                 elapsed = time.perf_counter() - t0
                 total_frames_done += num_frames
