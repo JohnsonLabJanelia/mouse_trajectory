@@ -106,7 +106,8 @@ for sess in "${SESSIONS[@]}"; do
     # Simple bar (20 chars)
     pct=0
     [ "$exp" -gt 0 ] && pct=$((done_n * 20 / exp))
-    bar=$(printf '%0.s█' $(seq 1 $pct))
+    bar=""
+    [ "$pct" -gt 0 ] && bar=$(printf '%.0s█' $(seq 1 $pct))
     bar=$(printf "%-20s" "$bar")
 
     printf "  %-40s  %6d / %-6d  [%s]\n" "$sess" "$done_n" "$exp" "$bar"
@@ -133,18 +134,21 @@ total_gpu_hr=$(
 )
 cost_so_far=$(echo "$total_gpu_hr $GPU_COST_PER_HR" | awk '{printf "%.2f", $1 * $2}')
 
-# Estimate remaining: 4.5M frames total, ~14 fps on L4
-TOTAL_FRAMES=4516734
-DONE_FRAMES=$(echo "$total_done $TOTAL_FRAMES $total_expected" \
-    | awk '{if($3>0) printf "%d", $1/$3*$2; else print 0}')
-REMAINING_FRAMES=$((TOTAL_FRAMES - DONE_FRAMES))
-# Remaining wall time dominated by longest unfinished session
-# Rough estimate: remaining_frames / 14fps / parallel_factor
+# Estimate remaining cost.
+# Jobs run in parallel (one GPU per session), so wall time ≈ longest session,
+# not total_frames/fps. Use 26 as max parallel (all sessions at once).
+N_SESSIONS=26
+MAX_SESSION_FRAMES=553038   # wilfred/2026_01_04_16_35_15 (largest session)
 n_active=$(bjobs -noheader -J "$JOB_NAME" 2>/dev/null | grep -c RUN || true)
-[ "$n_active" -eq 0 ] && n_active=1
-remaining_hr=$(echo "$REMAINING_FRAMES $n_active" \
-    | awk '{fps=14; par=$2; printf "%.1f", $1/(fps*par*3600)}')
-cost_remaining=$(echo "$remaining_hr $n_active $GPU_COST_PER_HR" \
+n_queued=$(bjobs -noheader -J "$JOB_NAME" 2>/dev/null | grep -c PEND || true)
+n_outstanding=$((n_active + n_queued))
+[ "$n_outstanding" -eq 0 ] && n_outstanding=$N_SESSIONS   # pre-submit estimate
+
+# Wall time estimate: largest remaining session / fps
+remaining_hr=$(echo "$MAX_SESSION_FRAMES" \
+    | awk '{fps=14; printf "%.1f", $1/(fps*3600)}')
+# Cost: every submitted job burns GPU time for its full wall time
+cost_remaining=$(echo "$n_outstanding $remaining_hr $GPU_COST_PER_HR" \
     | awk '{printf "%.2f", $1 * $2 * $3}')
 
 echo "  GPU-hours consumed so far : ${total_gpu_hr} hr  → \$${cost_so_far}"
