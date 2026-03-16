@@ -93,7 +93,7 @@ def list_calib_dates(calib_root: Path):
     return sorted(out, key=lambda t: t[0])
 
 
-def closest_calib(video_folder: str, calib_dates) -> Path | None:
+def closest_calib(video_folder: str, calib_dates):
     try:
         vd = datetime.strptime(video_folder[:19], '%Y_%m_%d_%H_%M_%S').date()
     except ValueError:

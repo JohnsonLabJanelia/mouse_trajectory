@@ -46,7 +46,7 @@ REF_CAMERA       = 'Cam2005325'   # arena mask is in this camera's image space
 # Calibration / projection
 # ---------------------------------------------------------------------------
 
-def load_calib_P(calib_dir: Path, cam_name: str) -> np.ndarray | None:
+def load_calib_P(calib_dir: Path, cam_name: str):
     """Load projection matrix P (3×4) for cam_name from calib_dir."""
     yaml_path = calib_dir / f'{cam_name}.yaml'
     if not yaml_path.exists():

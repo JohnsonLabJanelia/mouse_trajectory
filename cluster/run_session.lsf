@@ -31,11 +31,24 @@ NAS_HOST=10.10.1.28
 NAS_BASE=/mouse2/climb
 # make_dataset.py resolves videos as: video_root / animal / video_folder
 # so SCRATCH_ROOT must be the parent, with animal/video_folder beneath it
-SCRATCH_ROOT=/scratch/doq_$$
+# Use /scratch/doq if it exists (fast local NVMe), else fall back to /tmp
+if [[ -d /scratch/doq && -w /scratch/doq ]]; then
+    SCRATCH_ROOT=/scratch/doq/job_$$
+elif [[ -w /scratch ]]; then
+    mkdir -p /scratch/doq
+    SCRATCH_ROOT=/scratch/doq/job_$$
+else
+    echo "WARNING: /scratch not writable, falling back to /tmp (may be slow for large sessions)"
+    SCRATCH_ROOT=/tmp/doq_$$
+fi
 SCRATCH="$SCRATCH_ROOT/$ANIMAL/$VIDEO_FOLDER"
 CODE_DIR=$HOME/analyzeMiceTrajectory
 OUTPUT_DIR=$CODE_DIR/dataset
-CONDA_RUN="$HOME/miniconda3/bin/conda run -n jarvis_repro --no-capture-output"
+
+# Activate conda env by prepending its bin to PATH (works reliably in non-interactive jobs)
+CONDA_ENV="$HOME/miniconda3/envs/jarvis_repro"
+export PATH="$CONDA_ENV/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 # --- 1. Sync video data from NAS to scratch ---
 echo "[1/4] Syncing $SESSION from NAS to $SCRATCH ..."
@@ -47,23 +60,19 @@ rsync -a \
 
 echo "Sync complete. Size: $(du -sh "$SCRATCH" | cut -f1)"
 
-# --- 2. Compile TRT if needed (once per GPU architecture) ---
-TRT_DIR="$HOME/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D"
-if [[ ! -f "$TRT_DIR/centerDetect.pt" ]]; then
-    echo "[2/4] Compiling TRT models for this GPU architecture ..."
-    $CONDA_RUN python3 "$CODE_DIR/compile_trt_hybrid24.py" 2>&1
-else
-    echo "[2/4] TRT models already compiled, skipping."
-fi
+# --- 2. TRT (skipped — torch_tensorrt not in jarvis_repro env on cluster) ---
+# To enable TRT: pip install torch-tensorrt in jarvis_repro, then remove --no-trt below
+echo "[2/4] Skipping TRT compilation (using PyTorch models)"
 
 # --- 3. Run predictions ---
 echo "[3/4] Running predictions for $SESSION ..."
-$CONDA_RUN python3 "$CODE_DIR/make_dataset.py" \
+python3 "$CODE_DIR/make_dataset.py" \
     --session "$SESSION" \
     --video-root "$SCRATCH_ROOT" \
     --trials-dir "$OUTPUT_DIR" \
     --calib-root "$CODE_DIR/calib_params" \
     --output-dir "$OUTPUT_DIR" \
+    --no-trt \
     --skip-done \
     2>&1
 
