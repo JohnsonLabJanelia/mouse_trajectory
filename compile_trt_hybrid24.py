@@ -1,11 +1,21 @@
 """Compile TRT models for mouseHybrid24 predict2D pipeline."""
-import sys, os, torch, torch_tensorrt
+import sys, os
+from pathlib import Path
+import torch, torch_tensorrt
 
-sys.path.insert(0, '/home/user/src/JARVIS-HybridNet')
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_JARVIS_CANDIDATES = [
+    Path.home() / 'JARVIS-HybridNet',
+    _SCRIPT_DIR.parent / 'JARVIS-HybridNet',
+    Path('/home/user/src/JARVIS-HybridNet'),
+]
+JARVIS_DIR = next((p for p in _JARVIS_CANDIDATES if p.is_dir()), _JARVIS_CANDIDATES[0])
+sys.path.insert(0, str(JARVIS_DIR))
+
 from jarvis.config.project_manager import ProjectManager
 from jarvis.efficienttrack.efficienttrack import EfficientTrack
 
-trt_dir = '/home/user/src/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D'
+trt_dir = str(JARVIS_DIR / 'projects' / 'mouseHybrid24' / 'trt-models' / 'predict2D')
 os.makedirs(trt_dir, exist_ok=True)
 
 p = ProjectManager(); p.load('mouseHybrid24'); cfg = p.cfg
