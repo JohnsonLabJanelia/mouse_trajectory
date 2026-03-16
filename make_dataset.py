@@ -159,38 +159,37 @@ def _read_frame_parallel(caps, buf):
         return all(ex.map(_r, [(cap, i) for i, cap in enumerate(caps)]))
 
 
-def _iter_frames_decord(video_paths, frame_start, frame_end, stride,
-                         chunk_size=64):
+def _iter_frames_prefetch(video_paths, img_h, img_w, frame_start, frame_end,
+                           stride, prefetch=4):
     """
-    Yield (ok, imgs_tensor) for each strided frame in [frame_start, frame_end].
-    imgs_tensor: (N_cams, H, W, 3) uint8 CPU tensor (BGR via decord).
+    Yield (ok, imgs_numpy) for each strided frame in [frame_start, frame_end].
+    imgs_numpy: (N_cams, H, W, 3) uint8 numpy array.
 
-    Uses NVDEC if a CUDA context is available, otherwise multi-threaded CPU
-    decode.  A background thread prefetches the next chunk so GPU never waits.
+    A background thread reads ahead `prefetch` frames using a per-camera
+    ThreadPoolExecutor, so GPU inference and I/O run in parallel.
     """
-    # Try NVDEC (GPU) first; PyPI wheel usually lacks CUDA so fall back to CPU.
-    try:
-        ctx = _decord.gpu(0)
-        readers = [_decord.VideoReader(p, ctx=ctx, num_threads=1)
-                   for p in video_paths]
-    except Exception:
-        ctx = _decord.cpu(0)
-        readers = [_decord.VideoReader(p, ctx=ctx, num_threads=4)
-                   for p in video_paths]
-    frame_indices = list(range(frame_start, frame_end + 1, stride))
+    from concurrent.futures import ThreadPoolExecutor
 
-    pf_queue = queue.Queue(maxsize=2)   # prefetch at most 2 chunks ahead
+    num_cams = len(video_paths)
+    caps = [cv2.VideoCapture(p) for p in video_paths]
+    for cap in caps:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+
+    pf_queue = queue.Queue(maxsize=prefetch)
 
     def _loader():
-        for i in range(0, len(frame_indices), chunk_size):
-            chunk = frame_indices[i: i + chunk_size]
-            try:
-                # get_batch returns (chunk, H, W, 3) per reader
-                data = [r.get_batch(chunk) for r in readers]
-            except Exception as e:
-                pf_queue.put(('err', e))
-                return
-            pf_queue.put(('ok', chunk, data))
+        with ThreadPoolExecutor(max_workers=num_cams) as ex:
+            for abs_frame in range(frame_start, frame_end + 1, stride):
+                buf = np.zeros((num_cams, img_h, img_w, 3), dtype=np.uint8)
+
+                def read_one(i, _buf=buf):
+                    ret, img = caps[i].read()
+                    if ret and img is not None:
+                        _buf[i] = img
+                    return ret
+
+                rets = list(ex.map(read_one, range(num_cams)))
+                pf_queue.put((all(rets), buf))
         pf_queue.put(None)  # sentinel
 
     t = threading.Thread(target=_loader, daemon=True)
@@ -200,15 +199,11 @@ def _iter_frames_decord(video_paths, frame_start, frame_end, stride,
         item = pf_queue.get()
         if item is None:
             break
-        if item[0] == 'err':
-            raise RuntimeError(f'decord reader thread failed: {item[1]}')
-        _, chunk, cam_data = item
-        for j in range(len(chunk)):
-            # Stack cameras: list[(H,W,3)] -> (N_cams, H, W, 3)
-            imgs = torch.stack([cam_data[c][j] for c in range(len(readers))])
-            yield True, imgs
+        yield item
 
     t.join()
+    for cap in caps:
+        cap.release()
 
 
 def _infer_one_frame(imgs_t, cd_model, kd_model, mean, std,
@@ -306,79 +301,21 @@ def predict_trial(
 
     frames_written = 0
 
-    if HAVE_DECORD:
-        # Fast path: decord with NVDEC (if available) + async prefetch
-        try:
-            frame_iter = _iter_frames_decord(
-                video_paths, frame_start, frame_end, stride)
-            # Consume first item to verify readers opened successfully
-            # before truncating the output file
-            first = next(frame_iter, None)
-        except Exception as e:
-            log.warning(f'decord failed ({e}), falling back to cv2')
-            HAVE_DECORD_LOCAL = False
-        else:
-            HAVE_DECORD_LOCAL = True
-    else:
-        HAVE_DECORD_LOCAL = False
-
-    if HAVE_DECORD_LOCAL:
-        def _gen():
-            yield first
-            yield from frame_iter
-        for ok, imgs_buf in _gen():
-            if not ok:
-                writer.writerow(['NaN'] * (num_joints * 4))
-                frames_written += 1
-                continue
-            # decord BGR uint8 (N, H, W, 3) -> float CUDA (N, 3, H, W)
-            imgs_t = (imgs_buf.to('cuda', non_blocking=True).float()
-                      .permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
-            row = _infer_one_frame(
-                imgs_t, cd_model, kd_model, mean, std,
-                img_size_cd, bbox_size, img_h, img_w,
-                num_cameras, num_joints, Ps_np,
-                center_threshold, max_reproj_err)
-            writer.writerow(row)
+    for ok, imgs_buf in _iter_frames_prefetch(
+            video_paths, img_h, img_w, frame_start, frame_end, stride):
+        if not ok:
+            writer.writerow(['NaN'] * (num_joints * 4))
             frames_written += 1
-
-    if not HAVE_DECORD_LOCAL:
-        # cv2 fallback: sequential read with thread-pool per-camera
-        log.warning('decord not available — using cv2 (slower). '
-                    'Install with: pip install decord')
-        caps = [cv2.VideoCapture(p) for p in video_paths]
-        for cap in caps:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
-
-        imgs_buf = np.zeros((num_cameras, img_h, img_w, 3), dtype=np.uint8)
-        frame_rel = 0
-
-        for abs_frame in range(frame_start, frame_end + 1):
-            ok = _read_frame_parallel(caps, imgs_buf)
-            if not ok:
-                if frame_rel % stride == 0:
-                    writer.writerow(['NaN'] * (num_joints * 4))
-                    frames_written += 1
-                frame_rel += 1
-                continue
-
-            if frame_rel % stride != 0:
-                frame_rel += 1
-                continue
-            frame_rel += 1
-
-            imgs_t = (torch.from_numpy(imgs_buf).cuda().float()
-                      .permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
-            row = _infer_one_frame(
-                imgs_t, cd_model, kd_model, mean, std,
-                img_size_cd, bbox_size, img_h, img_w,
-                num_cameras, num_joints, Ps_np,
-                center_threshold, max_reproj_err)
-            writer.writerow(row)
-            frames_written += 1
-
-        for cap in caps:
-            cap.release()
+            continue
+        imgs_t = (torch.from_numpy(imgs_buf).to('cuda', non_blocking=True)
+                  .float().permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
+        row = _infer_one_frame(
+            imgs_t, cd_model, kd_model, mean, std,
+            img_size_cd, bbox_size, img_h, img_w,
+            num_cameras, num_joints, Ps_np,
+            center_threshold, max_reproj_err)
+        writer.writerow(row)
+        frames_written += 1
 
     csvfile.close()
     return True
