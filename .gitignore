@@ -30,6 +30,14 @@ calib_params/
 # Legacy / intermediate analysis outputs (data, not code)
 trajectory_analysis_old/
 
+# Dataset: raw per-trial prediction CSVs (large, regenerable via make_dataset.py)
+# Only sessions.csv (small metadata) is tracked.
+dataset/predictions_raw/
+dataset/*.log
+dataset/*.pid
+dataset/rory.csv
+dataset/wilfred.csv
+
 # Logs and analysis plots from cbot_climb_log
 cbot_climb_log/logs/
 cbot_climb_log/plots_*.png
