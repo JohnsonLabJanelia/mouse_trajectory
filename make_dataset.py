@@ -179,10 +179,12 @@ def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
     n_frames   = frame_end - frame_start + 1
     start_sec  = frame_start / fps
 
-    def _make_cmd(path):
-        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
-        if use_hwaccel:
-            cmd += ['-hwaccel', 'cuda', '-c:v', 'h264_cuvid']
+    def _make_cmd(path, hw):
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'warning']
+        if hw:
+            # Use -hwaccel cuda without specifying the decoder; ffmpeg will
+            # auto-select the right cuvid decoder (h264_cuvid, hevc_cuvid, …)
+            cmd += ['-hwaccel', 'cuda']
         cmd += [
             '-ss', f'{start_sec:.6f}',   # fast input-side seek
             '-i', path,
@@ -193,8 +195,9 @@ def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
 
     # Start one ffmpeg process per camera
     procs = [
-        subprocess.Popen(_make_cmd(p), stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL,
+        subprocess.Popen(_make_cmd(p, use_hwaccel),
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE,
                          bufsize=frame_size * 4)
         for p in video_paths
     ]
@@ -235,7 +238,10 @@ def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
     for proc in procs:
         try:
             proc.stdout.close()
+            stderr_out = proc.stderr.read(512).decode(errors='replace').strip()
             proc.wait(timeout=5)
+            if stderr_out:
+                log.debug(f'ffmpeg stderr: {stderr_out[:200]}')
         except Exception:
             proc.kill()
 
@@ -334,6 +340,7 @@ def predict_trial(
     writer.writerow(['x', 'y', 'z', 'confidence'] * num_joints)
 
     frames_written = 0
+    ok_frames = 0
 
     for ok, imgs_buf in _iter_frames_ffmpeg(
             video_paths, fps, img_h, img_w, frame_start, frame_end, stride):
@@ -341,6 +348,7 @@ def predict_trial(
             writer.writerow(['NaN'] * (num_joints * 4))
             frames_written += 1
             continue
+        ok_frames += 1
         imgs_t = (torch.from_numpy(imgs_buf).to('cuda', non_blocking=True)
                   .float().permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
         row = _infer_one_frame(
@@ -350,6 +358,10 @@ def predict_trial(
             center_threshold, max_reproj_err)
         writer.writerow(row)
         frames_written += 1
+
+    if ok_frames == 0 and frames_written > 0:
+        log.warning(f'All {frames_written} frames failed to decode '
+                    f'(ffmpeg returned no data) — check ffmpeg stderr above')
 
     csvfile.close()
     return True
