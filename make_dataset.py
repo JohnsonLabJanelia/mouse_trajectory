@@ -238,10 +238,10 @@ def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
     for proc in procs:
         try:
             proc.stdout.close()
-            stderr_out = proc.stderr.read(512).decode(errors='replace').strip()
+            stderr_out = proc.stderr.read(2048).decode(errors='replace').strip()
             proc.wait(timeout=5)
             if stderr_out:
-                log.debug(f'ffmpeg stderr: {stderr_out[:200]}')
+                log.warning(f'ffmpeg stderr (cam{procs.index(proc)}): {stderr_out[:300]}')
         except Exception:
             proc.kill()
 
