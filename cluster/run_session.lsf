@@ -1,0 +1,74 @@
+#!/bin/bash
+#BSUB -W 12:00
+#BSUB -n 12
+#BSUB -gpu "num=1"
+#BSUB -q gpu_a100
+#BSUB -P johnson
+#BSUB -J "dataset[1-26]"
+#BSUB -o /groups/johnson/home/doq/analyzeMiceTrajectory/cluster/logs/job_%J_%I.out
+#BSUB -e /groups/johnson/home/doq/analyzeMiceTrajectory/cluster/logs/job_%J_%I.err
+
+set -euo pipefail
+
+ARRAY_IDX=$LSB_JOBINDEX
+SESSIONS_FILE="$HOME/analyzeMiceTrajectory/cluster/sessions.txt"
+SESSION=$(sed -n "${ARRAY_IDX}p" "$SESSIONS_FILE")
+
+if [[ -z "$SESSION" ]]; then
+    echo "No session at index $ARRAY_IDX"
+    exit 1
+fi
+
+ANIMAL=$(echo "$SESSION" | cut -d/ -f1)
+VIDEO_FOLDER=$(echo "$SESSION" | cut -d/ -f2)
+
+echo "=== Job $LSB_JOBID[$ARRAY_IDX]: $SESSION ==="
+echo "Host: $(hostname)  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo unknown)"
+
+# --- Paths ---
+NAS_USER=ratan
+NAS_HOST=10.10.1.28
+NAS_BASE=/mouse2/climb
+# make_dataset.py resolves videos as: video_root / animal / video_folder
+# so SCRATCH_ROOT must be the parent, with animal/video_folder beneath it
+SCRATCH_ROOT=/scratch/doq_$$
+SCRATCH="$SCRATCH_ROOT/$ANIMAL/$VIDEO_FOLDER"
+CODE_DIR=$HOME/analyzeMiceTrajectory
+OUTPUT_DIR=$CODE_DIR/dataset
+CONDA_RUN="$HOME/miniconda3/bin/conda run -n jarvis_repro --no-capture-output"
+
+# --- 1. Sync video data from NAS to scratch ---
+echo "[1/4] Syncing $SESSION from NAS to $SCRATCH ..."
+mkdir -p "$SCRATCH"
+rsync -a \
+    "${NAS_USER}@${NAS_HOST}:${NAS_BASE}/${ANIMAL}/${VIDEO_FOLDER}/" \
+    "$SCRATCH/" \
+    2>&1 | tail -3
+
+echo "Sync complete. Size: $(du -sh "$SCRATCH" | cut -f1)"
+
+# --- 2. Compile TRT if needed (once per GPU architecture) ---
+TRT_DIR="$HOME/JARVIS-HybridNet/projects/mouseHybrid24/trt-models/predict2D"
+if [[ ! -f "$TRT_DIR/centerDetect.pt" ]]; then
+    echo "[2/4] Compiling TRT models for this GPU architecture ..."
+    $CONDA_RUN python3 "$CODE_DIR/compile_trt_hybrid24.py" 2>&1
+else
+    echo "[2/4] TRT models already compiled, skipping."
+fi
+
+# --- 3. Run predictions ---
+echo "[3/4] Running predictions for $SESSION ..."
+$CONDA_RUN python3 "$CODE_DIR/make_dataset.py" \
+    --session "$SESSION" \
+    --video-root "$SCRATCH_ROOT" \
+    --trials-dir "$OUTPUT_DIR" \
+    --calib-root "$CODE_DIR/calib_params" \
+    --output-dir "$OUTPUT_DIR" \
+    --skip-done \
+    2>&1
+
+# --- 4. Clean up scratch ---
+echo "[4/4] Cleaning up scratch ..."
+rm -rf "$SCRATCH_ROOT"
+
+echo "=== Done: $SESSION ==="

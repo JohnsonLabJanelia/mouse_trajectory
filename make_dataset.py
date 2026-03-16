@@ -46,14 +46,22 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, '/home/user/src/JARVIS-HybridNet')
+
+# Support running from any machine — find JARVIS relative to home or script
+_JARVIS_CANDIDATES = [
+    Path.home() / 'JARVIS-HybridNet',
+    SCRIPT_DIR.parent / 'JARVIS-HybridNet',
+    Path('/home/user/src/JARVIS-HybridNet'),
+]
+JARVIS_DIR = next((p for p in _JARVIS_CANDIDATES if p.is_dir()), _JARVIS_CANDIDATES[0])
+sys.path.insert(0, str(JARVIS_DIR))
 
 from jarvis.config.project_manager import ProjectManager
 from jarvis.efficienttrack.efficienttrack import EfficientTrack
 from predict2D_triangulate import load_all_calibrations, triangulate_dlt
 
 PROJECT      = 'mouseHybrid24'
-TRT_DIR      = f'/home/user/src/JARVIS-HybridNet/projects/{PROJECT}/trt-models/predict2D'
+TRT_DIR      = str(JARVIS_DIR / 'projects' / PROJECT / 'trt-models' / 'predict2D')
 CALIB_IGNORE = {'2025_12_19', '2025_12_21'}
 
 logging.basicConfig(
@@ -281,8 +289,12 @@ def group_by_session(trials):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--animals',     nargs='+', default=['rory', 'wilfred'])
-    ap.add_argument('--trials-dir',  type=Path, default=Path('/tmp'))
-    ap.add_argument('--video-root',  type=Path, default=Path('/mnt/mouse2'))
+    ap.add_argument('--session',     type=str,  default=None,
+                    help='Process only this one session, format: animal/video_folder '
+                         '(e.g. rory/2026_01_07_17_31_36). Used by cluster array jobs.')
+    ap.add_argument('--trials-dir',  type=Path, default=SCRIPT_DIR / 'dataset')
+    ap.add_argument('--video-root',  type=Path, default=Path('/mnt/mouse2'),
+                    help='Root dir containing animal/session subdirs with .mp4 files')
     ap.add_argument('--calib-root',  type=Path, default=SCRIPT_DIR / 'calib_params')
     ap.add_argument('--output-dir',  type=Path, default=SCRIPT_DIR / 'dataset')
     ap.add_argument('--stride',      type=int,  default=1,
@@ -293,6 +305,15 @@ def main():
     ap.add_argument('--center-threshold', type=float, default=40.0)
     ap.add_argument('--max-reproj-err',   type=float, default=200.0)
     args = ap.parse_args()
+
+    # --session animal/video_folder restricts to a single session (cluster jobs)
+    session_filter = None
+    if args.session:
+        parts = args.session.strip('/').split('/', 1)
+        if len(parts) != 2:
+            sys.exit('--session must be animal/video_folder, e.g. rory/2026_01_07_17_31_36')
+        session_filter = (parts[0], parts[1])
+        args.animals = [parts[0]]
 
     raw_dir     = args.output_dir / 'predictions_raw'
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -338,6 +359,8 @@ def main():
         log.info(f'=== {animal}: {len(trials)} trials across {len(by_session)} sessions ===')
 
         for session_idx, (video_folder, session_trials) in enumerate(sorted(by_session.items())):
+            if session_filter and (animal, video_folder) != session_filter:
+                continue
             rec_path = args.video_root / animal / video_folder
             if not rec_path.is_dir():
                 log.warning(f'  Skip {video_folder}: recording dir not found')
