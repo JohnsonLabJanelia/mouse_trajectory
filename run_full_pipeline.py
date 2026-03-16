@@ -158,23 +158,43 @@ def run_predict_trials(
     train_jarvis_dir: Path,
     jarvis_hybridnet_dir: Path,
     verbose: bool,
+    use_trt: bool = False,
 ) -> bool:
-    """Run predict_trials.py for one session. Returns True on success."""
+    """Run prediction for one session. Returns True on success.
+
+    When use_trt=True, routes to predict_trials_2d.py (2D + DLT triangulation,
+    mouseHybrid24 + TRT), which is faster and uses 24 keypoints.
+    Otherwise uses the original predict_trials.py (HybridNet 3D).
+    """
     if not session_csv_has_valid_trials(trials_csv):
         if verbose:
             print(f"[JARVIS] Skip {output_subdir}: no trials with valid frames in CSV")
         return False
     env = dict(__import__("os").environ)
     env["PYTHONPATH"] = f"{jarvis_hybridnet_dir}:{env.get('PYTHONPATH', '')}"
-    cmd = [
-        sys.executable,
-        str(train_jarvis_dir / "predict_trials.py"),
-        "--project", project,
-        "--recording-path", str(recording_path),
-        "--dataset-name", str(dataset_name),
-        "--trials-csv", str(trials_csv),
-        "--output-subdir", output_subdir,
-    ]
+
+    if use_trt:
+        # 2D + DLT pipeline: dataset_name is the calib_params YAML directory
+        cmd = [
+            sys.executable,
+            str(train_jarvis_dir / "predict_trials_2d.py"),
+            "--project", project,
+            "--recording-path", str(recording_path),
+            "--calib-dir", str(dataset_name),
+            "--trials-csv", str(trials_csv),
+            "--output-subdir", output_subdir,
+            "--trt",
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            str(train_jarvis_dir / "predict_trials.py"),
+            "--project", project,
+            "--recording-path", str(recording_path),
+            "--dataset-name", str(dataset_name),
+            "--trials-csv", str(trials_csv),
+            "--output-subdir", output_subdir,
+        ]
     result = subprocess.run(cmd, cwd=str(train_jarvis_dir), env=env)
     return result.returncode == 0
 
@@ -290,8 +310,16 @@ def main():
     )
     ap.add_argument(
         "--project",
-        default="mouseClimb4",
-        help="JARVIS project name (default: mouseClimb4)",
+        default="mouseHybrid24",
+        help="JARVIS project name (default: mouseHybrid24)",
+    )
+    ap.add_argument(
+        "--trt",
+        action="store_true",
+        help=(
+            "Use 2D + DLT triangulation pipeline (predict_trials_2d.py) with TRT models. "
+            "Faster and uses all 24 keypoints. Requires mouseHybrid24 TRT models compiled."
+        ),
     )
     ap.add_argument(
         "--calib-root",
@@ -562,6 +590,7 @@ def main():
                 train_jarvis_dir,
                 jarvis_hybridnet_dir,
                 verbose,
+                use_trt=args.trt,
             )
         if verbose:
             print("Done.")
