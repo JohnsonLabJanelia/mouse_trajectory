@@ -245,7 +245,33 @@ file.
 **Fix:** `run_session.lsf` now uses `-W 48:00`. Since `--skip-done` is set,
 a job can be resubmitted safely if it still gets killed.
 
-### 5. Video files not available during predictions
+### 5. NAS SSH connection refused when all jobs start simultaneously
+
+**Symptom:** Job exits in ~1 second with:
+```
+Connection closed by 10.10.1.28 port 22
+rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]
+rsync error: unexplained error (code 255) at io.c(228)
+```
+
+**Root cause:** All 26 array elements start at the same second and open 26
+simultaneous SSH connections to the NAS. The NAS drops the excess connections.
+
+**Fix (already in run_session.lsf):** A random stagger sleep of 0–119 seconds
+(seeded by array index) is added before the rsync. Jobs spread out across ~2
+minutes, keeping the NAS connection count manageable.
+
+**If it still happens:** Resubmit just the failed indices — `--skip-done` means
+no work is duplicated:
+```bash
+bsub -J "dataset[14,15]" -W 48:00 -n 12 -gpu "num=1" -q gpu_l4_large \
+  -P johnson \
+  -o ~/analyzeMiceTrajectory/cluster/logs/job_%J_%I.out \
+  -e ~/analyzeMiceTrajectory/cluster/logs/job_%J_%I.err \
+  ~/analyzeMiceTrajectory/cluster/run_session.lsf
+```
+
+### 6. Video files not available during predictions
 
 **Symptom:** `Expected N cameras, found 0` or similar
 

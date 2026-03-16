@@ -51,6 +51,12 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 
 # --- 1. Sync video data from NAS to scratch ---
+# Stagger rsync starts so all array elements don't hammer the NAS simultaneously.
+# Sleep a random 0–119 s (array index sets the seed for reproducibility).
+STAGGER=$(( (RANDOM + ARRAY_IDX * 17) % 120 ))
+echo "Stagger sleep: ${STAGGER}s (index $ARRAY_IDX)"
+sleep "$STAGGER"
+
 echo "[1/4] Syncing $SESSION from NAS to $SCRATCH ..."
 mkdir -p "$SCRATCH"
 rsync -a \
