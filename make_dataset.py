@@ -193,6 +193,51 @@ def _iter_frames_ffmpeg(video_paths, fps, img_h, img_w, frame_start, frame_end,
         ]
         return cmd
 
+    # Verify ffmpeg is reachable and can decode this video before starting all 16
+    _test_cmd = _make_cmd(video_paths[0], use_hwaccel) + []
+    _test_cmd[_test_cmd.index('-frames:v') + 1] = '1'   # only 1 frame for probe
+    log.info(f'ffmpeg probe cmd: {" ".join(_test_cmd[:8])}...')
+    _probe = subprocess.run(_test_cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=30)
+    actual_frame_size = len(_probe.stdout)
+    if actual_frame_size == 0:
+        _err = _probe.stderr.decode(errors='replace').strip()
+        log.warning(f'ffmpeg probe failed (hw={use_hwaccel}): {_err[:400]}')
+        if use_hwaccel:
+            log.info('Retrying without hwaccel...')
+            _test_cmd2 = _make_cmd(video_paths[0], False)
+            _test_cmd2[_test_cmd2.index('-frames:v') + 1] = '1'
+            _probe2 = subprocess.run(_test_cmd2, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=30)
+            if len(_probe2.stdout) > 0:
+                actual_frame_size = len(_probe2.stdout)
+                log.info('Software decode works — switching to no-hwaccel')
+                use_hwaccel = False
+            else:
+                log.error(f'Software probe also failed: '
+                          f'{_probe2.stderr.decode(errors="replace")[:200]}')
+                return
+        else:
+            return
+
+    if actual_frame_size != frame_size:
+        # Actual frame size from ffmpeg differs from cv2 — recompute dimensions
+        # (common if video has alignment padding)
+        if actual_frame_size % 3 == 0:
+            n_pixels = actual_frame_size // 3
+            # Try to find matching h/w from known values
+            if img_h * img_w == n_pixels:
+                pass   # matches, dimensions are fine
+            else:
+                new_w = n_pixels // img_h
+                log.info(f'Frame size mismatch: cv2={frame_size} ffmpeg={actual_frame_size}'
+                         f' — using ffmpeg size (w={new_w})')
+                img_w = new_w
+                frame_size = actual_frame_size
+
+    log.info(f'ffmpeg probe OK ({actual_frame_size} bytes/frame, '
+             f'hw={use_hwaccel}, res={img_w}x{img_h})')
+
     # Start one ffmpeg process per camera
     procs = [
         subprocess.Popen(_make_cmd(p, use_hwaccel),

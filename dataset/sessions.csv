@@ -1,2 +1,3 @@
 animal,video_folder,calib_date,video_path,calib_dir,n_trials,fps
 rory,2025_12_23_16_57_09,2025_12_22,/mnt/mouse2/rory/2025_12_23_16_57_09,/home/user/src/analyzeMiceTrajectory/calib_params/2025_12_22,9,180.0
+rory,2025_12_24_13_29_06,2025_12_24,/mnt/mouse2/rory/2025_12_24_13_29_06,/home/user/src/analyzeMiceTrajectory/calib_params/2025_12_24,1,180.0
