@@ -1,8 +1,8 @@
 #!/bin/bash
-#BSUB -W 12:00
+#BSUB -W 48:00
 #BSUB -n 12
 #BSUB -gpu "num=1"
-#BSUB -q gpu_t4
+#BSUB -q gpu_l4_large
 #BSUB -P johnson
 #BSUB -J "dataset[1-26]"
 #BSUB -o /groups/johnson/home/doq/analyzeMiceTrajectory/cluster/logs/job_%J_%I.out
