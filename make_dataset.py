@@ -38,12 +38,24 @@ import logging
 from datetime import datetime, date
 from pathlib import Path
 
+import queue
+import threading
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
+# decord: fast video I/O with optional NVDEC hardware decode.
+# Falls back to cv2 if not installed.
+try:
+    import decord as _decord
+    _decord.bridge.set_bridge('torch')
+    HAVE_DECORD = True
+except ImportError:
+    HAVE_DECORD = False
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -135,13 +147,117 @@ def load_models(use_trt: bool):
 # ---------------------------------------------------------------------------
 
 def _read_frame_parallel(caps, buf):
-    def _r(cap, i):
+    """cv2 fallback: read one frame from all cameras using a thread pool."""
+    def _r(args):
+        cap, i = args
         ret, img = cap.read()
         if ret and img is not None:
             buf[i] = img
         return ret
-    return all(Parallel(n_jobs=len(caps), require='sharedmem')(
-        delayed(_r)(cap, i) for i, cap in enumerate(caps)))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(caps)) as ex:
+        return all(ex.map(_r, [(cap, i) for i, cap in enumerate(caps)]))
+
+
+def _iter_frames_decord(video_paths, frame_start, frame_end, stride,
+                         chunk_size=64):
+    """
+    Yield (ok, imgs_tensor) for each strided frame in [frame_start, frame_end].
+    imgs_tensor: (N_cams, H, W, 3) uint8 CPU tensor (BGR via decord).
+
+    Uses NVDEC if a CUDA context is available, otherwise multi-threaded CPU
+    decode.  A background thread prefetches the next chunk so GPU never waits.
+    """
+    ctx = _decord.gpu(0) if torch.cuda.is_available() else _decord.cpu(0)
+    readers = [_decord.VideoReader(p, ctx=ctx, num_threads=4)
+               for p in video_paths]
+    frame_indices = list(range(frame_start, frame_end + 1, stride))
+
+    pf_queue = queue.Queue(maxsize=2)   # prefetch at most 2 chunks ahead
+
+    def _loader():
+        for i in range(0, len(frame_indices), chunk_size):
+            chunk = frame_indices[i: i + chunk_size]
+            try:
+                # get_batch returns (chunk, H, W, 3) per reader
+                data = [r.get_batch(chunk) for r in readers]
+            except Exception as e:
+                pf_queue.put(('err', e))
+                return
+            pf_queue.put(('ok', chunk, data))
+        pf_queue.put(None)  # sentinel
+
+    t = threading.Thread(target=_loader, daemon=True)
+    t.start()
+
+    while True:
+        item = pf_queue.get()
+        if item is None:
+            break
+        if item[0] == 'err':
+            raise RuntimeError(f'decord reader thread failed: {item[1]}')
+        _, chunk, cam_data = item
+        for j in range(len(chunk)):
+            # Stack cameras: list[(H,W,3)] -> (N_cams, H, W, 3)
+            imgs = torch.stack([cam_data[c][j] for c in range(len(readers))])
+            yield True, imgs
+
+    t.join()
+
+
+def _infer_one_frame(imgs_t, cd_model, kd_model, mean, std,
+                     img_size_cd, bbox_size, img_h, img_w,
+                     num_cameras, num_joints, Ps_np,
+                     center_threshold, max_reproj_err):
+    """
+    Run CenterDetect + KeypointDetect + DLT on a single (N_cams, 3, H, W)
+    float CUDA tensor.  Returns a flat CSV row or None on no detection.
+    """
+    bbox_hw = bbox_size // 2
+    with torch.no_grad():
+        imgs_cd = F.interpolate(imgs_t, (img_size_cd,) * 2,
+                                mode='bilinear', align_corners=False)
+        cd_out  = cd_model((imgs_cd - mean) / std)
+        hm      = cd_out[1].view(num_cameras, -1)
+        m       = hm.argmax(1)
+        maxvals = hm[range(num_cameras), m]
+        cx = (m % cd_out[1].shape[3]).float() * (img_w / cd_out[1].shape[3])
+        cy = (m // cd_out[1].shape[3]).float() * (img_h / cd_out[1].shape[2])
+        cx = cx.long().clamp(bbox_hw, img_w - bbox_hw)
+        cy = cy.long().clamp(bbox_hw, img_h - bbox_hw)
+
+        det_idx = torch.where(maxvals > center_threshold)[0].cpu().numpy()
+        if len(det_idx) < 2:
+            return ['NaN'] * (num_joints * 4)
+
+        crops = torch.stack([
+            imgs_t[i, :, cy[i] - bbox_hw: cy[i] + bbox_hw,
+                         cx[i] - bbox_hw: cx[i] + bbox_hw]
+            for i in det_idx])
+        kp_out  = kd_model((crops - mean) / std)
+        hm_kp   = kp_out[1].view(len(det_idx), num_joints, -1)
+        m_kp    = hm_kp.argmax(2)
+        conf_kp = (hm_kp.gather(2, m_kp.unsqueeze(-1)).squeeze(-1)
+                   .clamp(max=255.) / 255.).cpu().numpy()
+        kp_x    = (m_kp % kp_out[1].shape[3]).float() * 2
+        kp_y    = (m_kp // kp_out[1].shape[3]).float() * 2
+        kp_x   += (cx[det_idx] - bbox_hw).float().unsqueeze(1)
+        kp_y   += (cy[det_idx] - bbox_hw).float().unsqueeze(1)
+        kp_x    = kp_x.cpu().numpy()
+        kp_y    = kp_y.cpu().numpy()
+
+    row = []
+    for j in range(num_joints):
+        pts2d = np.stack([kp_x[:, j], kp_y[:, j]], axis=1)
+        confs = conf_kp[:, j]
+        pt3d  = triangulate_dlt(pts2d, Ps_np[det_idx], confs,
+                                max_reproj_err=max_reproj_err)
+        if pt3d is not None:
+            row += [float(pt3d[0]), float(pt3d[1]), float(pt3d[2]),
+                    float(confs.mean())]
+        else:
+            row += ['NaN', 'NaN', 'NaN', 'NaN']
+    return row
 
 
 def predict_trial(
@@ -153,112 +269,95 @@ def predict_trial(
     """Predict one trial and write data3D.csv to output_dir."""
     img_size_cd = cfg.CENTERDETECT.IMAGE_SIZE
     bbox_size   = cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE
-    bbox_hw     = bbox_size // 2
     num_joints  = cfg.KEYPOINTDETECT.NUM_JOINTS
     num_cameras = len(camera_names)
 
-    # Open video captures and seek
-    caps = []
+    # Resolve video paths (camera_name.mp4 inside recording_path)
+    video_paths = []
     for cn in camera_names:
         for fname in os.listdir(recording_path):
             if fname.split('.')[0] == cn and fname.endswith('.mp4'):
-                cap = cv2.VideoCapture(os.path.join(recording_path, fname))
-                caps.append(cap)
+                video_paths.append(os.path.join(recording_path, fname))
                 break
-    if len(caps) != num_cameras:
-        log.error(f'Expected {num_cameras} cameras, found {len(caps)}')
+    if len(video_paths) != num_cameras:
+        log.error(f'Expected {num_cameras} cameras, found {len(video_paths)}')
         return False
 
-    for cap in caps:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
-
-    img_h = int(caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
-    img_w = int(caps[0].get(cv2.CAP_PROP_FRAME_WIDTH))
-    imgs_buf = np.zeros((num_cameras, img_h, img_w, 3), dtype=np.uint8)
+    # Get frame dimensions from the first video
+    _cap = cv2.VideoCapture(video_paths[0])
+    img_h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    img_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    _cap.release()
 
     os.makedirs(output_dir, exist_ok=True)
     csvfile = open(os.path.join(output_dir, 'data3D.csv'), 'w', newline='')
     writer  = csv.writer(csvfile)
 
-    # Header rows (keypoint name + coordinate)
     kp_names = cfg.KEYPOINT_NAMES
     writer.writerow(list(itertools.chain.from_iterable(
         itertools.repeat(kp, 4) for kp in kp_names)))
     writer.writerow(['x', 'y', 'z', 'confidence'] * num_joints)
 
-    num_frames = frame_end - frame_start + 1
     frames_written = 0
-    frame_rel = 0  # relative to trial start
 
-    for abs_frame in range(frame_start, frame_end + 1):
-        # For stride > 1: read but only process every Nth frame
-        ok = _read_frame_parallel(caps, imgs_buf)
-        if not ok:
-            if frame_rel % stride == 0:
-                writer.writerow(['NaN'] * (num_joints * 4))
-                frames_written += 1
-            frame_rel += 1
-            continue
-
-        if frame_rel % stride != 0:
-            frame_rel += 1
-            continue
-        frame_rel += 1
-
-        imgs_t = (torch.from_numpy(imgs_buf).cuda().float()
-                  .permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
-
-        with torch.no_grad():
-            imgs_cd = F.interpolate(imgs_t, (img_size_cd,)*2,
-                                    mode='bilinear', align_corners=False)
-            cd_out  = cd_model((imgs_cd - mean) / std)
-            hm      = cd_out[1].view(num_cameras, -1)
-            m       = hm.argmax(1)
-            maxvals = hm[range(num_cameras), m]
-            cx = (m % cd_out[1].shape[3]).float() * (img_w / cd_out[1].shape[3])
-            cy = (m // cd_out[1].shape[3]).float() * (img_h / cd_out[1].shape[2])
-            cx = cx.long().clamp(bbox_hw, img_w - bbox_hw)
-            cy = cy.long().clamp(bbox_hw, img_h - bbox_hw)
-
-            det_idx = torch.where(maxvals > center_threshold)[0].cpu().numpy()
-
-            if len(det_idx) < 2:
+    if HAVE_DECORD:
+        # Fast path: decord with NVDEC + async prefetch
+        frame_iter = _iter_frames_decord(
+            video_paths, frame_start, frame_end, stride)
+        for ok, imgs_buf in frame_iter:
+            if not ok:
                 writer.writerow(['NaN'] * (num_joints * 4))
                 frames_written += 1
                 continue
+            # decord BGR uint8 (N, H, W, 3) -> float CUDA (N, 3, H, W)
+            imgs_t = (imgs_buf.to('cuda', non_blocking=True).float()
+                      .permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
+            row = _infer_one_frame(
+                imgs_t, cd_model, kd_model, mean, std,
+                img_size_cd, bbox_size, img_h, img_w,
+                num_cameras, num_joints, Ps_np,
+                center_threshold, max_reproj_err)
+            writer.writerow(row)
+            frames_written += 1
 
-            crops = torch.stack([
-                imgs_t[i, :, cy[i]-bbox_hw:cy[i]+bbox_hw,
-                              cx[i]-bbox_hw:cx[i]+bbox_hw]
-                for i in det_idx])
-            kp_out  = kd_model((crops - mean) / std)
-            hm_kp   = kp_out[1].view(len(det_idx), num_joints, -1)
-            m_kp    = hm_kp.argmax(2)
-            conf_kp = (hm_kp.gather(2, m_kp.unsqueeze(-1)).squeeze(-1)
-                       .clamp(max=255.) / 255.).cpu().numpy()
-            kp_x    = (m_kp % kp_out[1].shape[3]).float() * 2
-            kp_y    = (m_kp // kp_out[1].shape[3]).float() * 2
-            kp_x   += (cx[det_idx] - bbox_hw).float().unsqueeze(1)
-            kp_y   += (cy[det_idx] - bbox_hw).float().unsqueeze(1)
-            kp_x    = kp_x.cpu().numpy()
-            kp_y    = kp_y.cpu().numpy()
+    else:
+        # cv2 fallback: sequential read with thread-pool per-camera
+        log.warning('decord not available — using cv2 (slower). '
+                    'Install with: pip install decord')
+        caps = [cv2.VideoCapture(p) for p in video_paths]
+        for cap in caps:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
 
-        row = []
-        for j in range(num_joints):
-            pts2d = np.stack([kp_x[:, j], kp_y[:, j]], axis=1)
-            confs = conf_kp[:, j]
-            pt3d  = triangulate_dlt(pts2d, Ps_np[det_idx], confs,
-                                    max_reproj_err=max_reproj_err)
-            if pt3d is not None:
-                row += [float(pt3d[0]), float(pt3d[1]), float(pt3d[2]),
-                        float(confs.mean())]
-            else:
-                row += ['NaN', 'NaN', 'NaN', 'NaN']
-        writer.writerow(row)
-        frames_written += 1
+        imgs_buf = np.zeros((num_cameras, img_h, img_w, 3), dtype=np.uint8)
+        frame_rel = 0
 
-    for cap in caps:
-        cap.release()
+        for abs_frame in range(frame_start, frame_end + 1):
+            ok = _read_frame_parallel(caps, imgs_buf)
+            if not ok:
+                if frame_rel % stride == 0:
+                    writer.writerow(['NaN'] * (num_joints * 4))
+                    frames_written += 1
+                frame_rel += 1
+                continue
+
+            if frame_rel % stride != 0:
+                frame_rel += 1
+                continue
+            frame_rel += 1
+
+            imgs_t = (torch.from_numpy(imgs_buf).cuda().float()
+                      .permute(0, 3, 1, 2)[:, [2, 1, 0]] / 255.0)
+            row = _infer_one_frame(
+                imgs_t, cd_model, kd_model, mean, std,
+                img_size_cd, bbox_size, img_h, img_w,
+                num_cameras, num_joints, Ps_np,
+                center_threshold, max_reproj_err)
+            writer.writerow(row)
+            frames_written += 1
+
+        for cap in caps:
+            cap.release()
+
     csvfile.close()
     return True
 
